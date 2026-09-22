@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""Read and apply Omarchy Glide (touchpad feel) settings.
+
+Live apply uses hyprctl eval (Lua config cannot use hyprctl keyword).
+Persistence is ~/.config/omarchy/touchpad.toml, also read by
+~/.config/hypr/input.lua on Hyprland reload. Pointer speed is per-device
+so an external mouse is left alone.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import subprocess
+import sys
+
+CONFIG = os.path.expanduser("~/.config/omarchy/touchpad.toml")
+LOCK = CONFIG + ".lock"
+
+DEFAULTS = {
+    "device": "",
+    "sensitivity": 0.0,
+    "accel_profile": "adaptive",
+    "scroll_factor": 0.4,
+    "natural_scroll": False,
+    "disable_while_typing": True,
+    "clickfinger_behavior": True,
+}
+
+# Modest bump vs stock 0.0 when first creating the file for a slow pad.
+FIRST_WRITE_SENSITIVITY = 0.30
+
+KEYS = {
+    "device": str,
+    "sensitivity": float,
+    "accel_profile": str,
+    "scroll_factor": float,
+    "natural_scroll": bool,
+    "disable_while_typing": bool,
+    "clickfinger_behavior": bool,
+}
+
+ALIASES = {
+    "scroll-factor": "scroll_factor",
+    "accel": "accel_profile",
+    "accel-profile": "accel_profile",
+    "natural-scroll": "natural_scroll",
+    "disable-while-typing": "disable_while_typing",
+    "clickfinger": "clickfinger_behavior",
+    "clickfinger-behavior": "clickfinger_behavior",
+}
+
+
+def usage() -> None:
+    print(
+        """Usage:
+  omarchy-glide [get] [--json]
+  omarchy-glide set <key> <value> [<key> <value> ...]
+  omarchy-glide apply
+  omarchy-glide reset
+  omarchy-glide panel
+
+Keys: sensitivity, scroll-factor, accel-profile (adaptive|flat),
+      natural-scroll, disable-while-typing, clickfinger-behavior, device
+"""
+    )
+
+
+def detect_device() -> str:
+    try:
+        out = subprocess.check_output(["omarchy-hw-touchpad"], text=True).strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return ""
+    return out.splitlines()[0].strip() if out else ""
+
+
+def parse_toml(path: str) -> dict:
+    cfg = dict(DEFAULTS)
+    if not os.path.isfile(path):
+        return cfg
+    with open(path, encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#") or line.startswith("["):
+                continue
+            if "=" not in line:
+                continue
+            key, raw_val = line.split("=", 1)
+            key = key.strip()
+            raw_val = raw_val.strip()
+            if key not in KEYS:
+                continue
+            if not (raw_val.startswith("'") or raw_val.startswith('"')):
+                raw_val = raw_val.split("#", 1)[0].strip()
+            cfg[key] = coerce(key, raw_val)
+    return cfg
+
+
+def coerce(key: str, raw) -> object:
+    kind = KEYS[key]
+    if isinstance(raw, str):
+        text = raw.strip()
+        if len(text) >= 2 and text[0] in "'\"" and text[-1] == text[0]:
+            text = text[1:-1]
+    else:
+        text = raw
+    if kind is bool:
+        if isinstance(text, bool):
+            return text
+        return str(text).strip().lower() in ("1", "true", "yes", "on")
+    if kind is float:
+        value = float(text)
+        if key == "sensitivity":
+            value = max(-1.0, min(1.0, value))
+        elif key == "scroll_factor":
+            value = max(0.05, min(5.0, value))
+        return round(value, 3)
+    text = str(text).strip()
+    if key == "accel_profile":
+        text = text.lower()
+        if text not in ("adaptive", "flat"):
+            text = "adaptive"
+    return text
+
+
+def dump_toml(cfg: dict) -> str:
+    def fmt(key: str) -> str:
+        value = cfg[key]
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, float):
+            return f"{value:.3f}".rstrip("0").rstrip(".")
+        return json.dumps(str(value))
+
+    return (
+        "# Glide (touchpad feel). Applied live by omarchy-glide; also read by\n"
+        "# ~/.config/hypr/input.lua on Hyprland reload. Pointer speed is\n"
+        "# per-device so an external mouse is unchanged.\n"
+        f"device = {fmt('device')}\n"
+        f"sensitivity = {fmt('sensitivity')}\n"
+        f"accel_profile = {fmt('accel_profile')}\n"
+        f"scroll_factor = {fmt('scroll_factor')}\n"
+        f"natural_scroll = {fmt('natural_scroll')}\n"
+        f"disable_while_typing = {fmt('disable_while_typing')}\n"
+        f"clickfinger_behavior = {fmt('clickfinger_behavior')}\n"
+    )
+
+
+def with_lock(fn):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    with open(LOCK, "w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return fn()
+
+
+def load_or_create() -> dict:
+    cfg = parse_toml(CONFIG)
+    if not os.path.isfile(CONFIG):
+        cfg["device"] = detect_device()
+        cfg["sensitivity"] = FIRST_WRITE_SENSITIVITY
+        save(cfg)
+    elif not cfg.get("device"):
+        cfg["device"] = detect_device()
+    return cfg
+
+
+def save(cfg: dict) -> None:
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(dump_toml(cfg))
+    os.replace(tmp, CONFIG)
+
+
+def lua_bool(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def lua_string(value: str) -> str:
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def apply(cfg: dict) -> None:
+    device = cfg.get("device") or detect_device()
+    snippets = [
+        "hl.config({ input = { touchpad = { "
+        f"natural_scroll = {lua_bool(cfg['natural_scroll'])}, "
+        f"scroll_factor = {cfg['scroll_factor']}, "
+        f"disable_while_typing = {lua_bool(cfg['disable_while_typing'])}, "
+        f"clickfinger_behavior = {lua_bool(cfg['clickfinger_behavior'])} "
+        "} } })"
+    ]
+    if device:
+        snippets.append(
+            "hl.device({ "
+            f"name = {lua_string(device)}, "
+            f"sensitivity = {cfg['sensitivity']}, "
+            f"accel_profile = {lua_string(cfg['accel_profile'])}, "
+            f"natural_scroll = {lua_bool(cfg['natural_scroll'])}, "
+            f"scroll_factor = {cfg['scroll_factor']}, "
+            f"disable_while_typing = {lua_bool(cfg['disable_while_typing'])}, "
+            f"clickfinger_behavior = {lua_bool(cfg['clickfinger_behavior'])} "
+            "})"
+        )
+    for snippet in snippets:
+        out = subprocess.check_output(["hyprctl", "eval", snippet], text=True)
+        if out.strip() and out.strip() != "ok":
+            raise SystemExit(out.strip())
+
+
+def public_state(cfg: dict) -> dict:
+    device = cfg.get("device") or detect_device()
+    return {
+        "device": device,
+        "sensitivity": cfg["sensitivity"],
+        "accel_profile": cfg["accel_profile"],
+        "scroll_factor": cfg["scroll_factor"],
+        "natural_scroll": cfg["natural_scroll"],
+        "disable_while_typing": cfg["disable_while_typing"],
+        "clickfinger_behavior": cfg["clickfinger_behavior"],
+        "speed": int(round((float(cfg["sensitivity"]) + 1.0) * 50.0)),
+        "scroll_percent": int(round(float(cfg["scroll_factor"]) * 100.0)),
+    }
+
+
+def normalize_key(key: str) -> str:
+    key = key.strip().lstrip("-").replace("-", "_")
+    key = ALIASES.get(key.replace("_", "-"), key)
+    key = ALIASES.get(key, key)
+    if key not in KEYS:
+        raise SystemExit(f"Unknown key: {key}")
+    return key
+
+
+def parse_set_args(args: list[str]) -> dict:
+    updates = {}
+    i = 0
+    while i < len(args):
+        token = args[i]
+        if "=" in token and not token.startswith("="):
+            key, value = token.split("=", 1)
+            updates[normalize_key(key)] = coerce(normalize_key(key), value)
+            i += 1
+            continue
+        if i + 1 >= len(args):
+            raise SystemExit(f"Missing value for {token}")
+        key = normalize_key(token)
+        updates[key] = coerce(key, args[i + 1])
+        i += 2
+    return updates
+
+
+def print_human(state: dict) -> None:
+    print(f"device                {state['device'] or '(none)'}")
+    print(f"sensitivity           {state['sensitivity']}  (speed {state['speed']}/100)")
+    print(f"accel_profile         {state['accel_profile']}")
+    print(f"scroll_factor         {state['scroll_factor']}  ({state['scroll_percent']}%)")
+    print(f"natural_scroll        {str(state['natural_scroll']).lower()}")
+    print(f"disable_while_typing  {str(state['disable_while_typing']).lower()}")
+    print(f"clickfinger_behavior  {str(state['clickfinger_behavior']).lower()}")
+
+
+def main(argv: list[str]) -> int:
+    args = list(argv)
+    json_out = False
+    if "--json" in args:
+        json_out = True
+        args.remove("--json")
+    if not args or args[0] in ("get", "show", "status"):
+        cfg = with_lock(load_or_create)
+        state = public_state(cfg)
+        if json_out:
+            print(json.dumps(state))
+        else:
+            print_human(state)
+        return 0
+    cmd = args[0]
+    if cmd in ("-h", "--help", "help"):
+        usage()
+        return 0
+    if cmd == "panel":
+        subprocess.check_call(
+            ["omarchy-shell", "shell", "summon", "payton.glide", "{}"]
+        )
+        return 0
+    if cmd == "apply":
+        cfg = with_lock(load_or_create)
+        apply(cfg)
+        if json_out:
+            print(json.dumps(public_state(cfg)))
+        return 0
+    if cmd == "reset":
+        def reset() -> dict:
+            cfg = dict(DEFAULTS)
+            cfg["device"] = detect_device()
+            save(cfg)
+            return cfg
+
+        cfg = with_lock(reset)
+        apply(cfg)
+        state = public_state(cfg)
+        if json_out:
+            print(json.dumps(state))
+        else:
+            print_human(state)
+        return 0
+    if cmd == "set":
+        updates = parse_set_args(args[1:])
+        if not updates:
+            usage()
+            return 2
+
+        def mutate() -> dict:
+            cfg = load_or_create()
+            cfg.update(updates)
+            if not cfg.get("device"):
+                cfg["device"] = detect_device()
+            save(cfg)
+            return cfg
+
+        cfg = with_lock(mutate)
+        apply(cfg)
+        state = public_state(cfg)
+        if json_out:
+            print(json.dumps(state))
+        return 0
+    usage()
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except subprocess.CalledProcessError as exc:
+        err = (exc.output or "") + (exc.stderr or "")
+        raise SystemExit(err.strip() or str(exc))

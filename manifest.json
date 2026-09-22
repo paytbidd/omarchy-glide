@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "payton.glide",
+  "name": "Glide",
+  "version": "1.0.0",
+  "author": "Payton Biddington",
+  "description": "Pointer speed, scroll, and acceleration for the laptop touchpad",
+  "homepage": "https://github.com/paytbidd/omarchy-glide",
+  "license": "MIT",
+  "kinds": [
+    "panel"
+  ],
+  "entryPoints": {
+    "panel": "Panel.qml"
+  }
+}
